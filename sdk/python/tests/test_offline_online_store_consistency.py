@@ -1,10 +1,11 @@
 import contextlib
+import math
 import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator, Tuple, Union
+from typing import Iterator, Optional, Tuple, Union
 
 import pandas as pd
 import pytest
@@ -17,7 +18,12 @@ from feast.entity import Entity
 from feast.feature import Feature
 from feast.feature_store import FeatureStore
 from feast.feature_view import FeatureView
-from feast.repo_config import RepoConfig, SqliteOnlineStoreConfig
+from feast.infra.offline_stores.file import FileOfflineStoreConfig
+from feast.infra.online_stores.datastore import DatastoreOnlineStoreConfig
+from feast.infra.online_stores.dynamodb import DynamoDBOnlineStoreConfig
+from feast.infra.online_stores.redis import RedisOnlineStoreConfig, RedisType
+from feast.infra.online_stores.sqlite import SqliteOnlineStoreConfig
+from feast.repo_config import RepoConfig
 from feast.value_type import ValueType
 
 
@@ -26,7 +32,7 @@ def create_dataset() -> pd.DataFrame:
     ts = pd.Timestamp(now).round("ms")
     data = {
         "id": [1, 2, 1, 3, 3],
-        "value": [0.1, 0.2, 0.3, 4, 5],
+        "value": [0.1, None, 0.3, 4, 5],
         "ts_1": [
             ts - timedelta(hours=4),
             ts,
@@ -72,7 +78,7 @@ def prep_bq_fs_and_fv(
     df = create_dataset()
 
     job_config = bigquery.LoadJobConfig()
-    table_ref = f"{gcp_project}.{bigquery_dataset}.{bq_source_type}_correctness_{int(time.time())}"
+    table_ref = f"{gcp_project}.{bigquery_dataset}.{bq_source_type}_correctness_{int(time.time_ns())}"
     query = f"SELECT * FROM `{table_ref}`"
     job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
     job.result()
@@ -98,11 +104,14 @@ def prep_bq_fs_and_fv(
             registry=str(Path(repo_dir_name) / "registry.db"),
             project=f"test_bq_correctness_{str(uuid.uuid4()).replace('-', '')}",
             provider="gcp",
+            online_store=DatastoreOnlineStoreConfig(namespace="integration_test"),
         )
         fs = FeatureStore(config=config)
         fs.apply([fv, e])
 
         yield fs, fv
+
+        fs.teardown()
 
 
 @contextlib.contextmanager
@@ -126,10 +135,13 @@ def prep_local_fs_and_fv() -> Iterator[Tuple[FeatureStore, FeatureView]]:
             join_key="driver_id",
             value_type=ValueType.INT32,
         )
+        project = f"test_local_correctness_{str(uuid.uuid4()).replace('-', '')}"
+        print(f"Using project: {project}")
+
         with tempfile.TemporaryDirectory() as repo_dir_name, tempfile.TemporaryDirectory() as data_dir_name:
             config = RepoConfig(
                 registry=str(Path(repo_dir_name) / "registry.db"),
-                project=f"test_bq_correctness_{str(uuid.uuid4()).replace('-', '')}",
+                project=project,
                 provider="local",
                 online_store=SqliteOnlineStoreConfig(
                     path=str(Path(data_dir_name) / "online_store.db")
@@ -140,6 +152,89 @@ def prep_local_fs_and_fv() -> Iterator[Tuple[FeatureStore, FeatureView]]:
 
             yield fs, fv
 
+            fs.teardown()
+
+
+@contextlib.contextmanager
+def prep_redis_fs_and_fv() -> Iterator[Tuple[FeatureStore, FeatureView]]:
+    with tempfile.NamedTemporaryFile(suffix=".parquet") as f:
+        df = create_dataset()
+        f.close()
+        df.to_parquet(f.name)
+        file_source = FileSource(
+            file_format=ParquetFormat(),
+            file_url=f"file://{f.name}",
+            event_timestamp_column="ts",
+            created_timestamp_column="created_ts",
+            date_partition_column="",
+            field_mapping={"ts_1": "ts", "id": "driver_id"},
+        )
+        fv = get_feature_view(file_source)
+        e = Entity(
+            name="driver",
+            description="id for driver",
+            join_key="driver_id",
+            value_type=ValueType.INT32,
+        )
+        project = f"test_redis_correctness_{str(uuid.uuid4()).replace('-', '')}"
+        print(f"Using project: {project}")
+        with tempfile.TemporaryDirectory() as repo_dir_name:
+            config = RepoConfig(
+                registry=str(Path(repo_dir_name) / "registry.db"),
+                project=project,
+                provider="local",
+                online_store=RedisOnlineStoreConfig(
+                    type="redis",
+                    redis_type=RedisType.redis,
+                    connection_string="localhost:6379,db=0",
+                ),
+            )
+            fs = FeatureStore(config=config)
+            fs.apply([fv, e])
+
+            yield fs, fv
+
+            fs.teardown()
+
+
+@contextlib.contextmanager
+def prep_dynamodb_fs_and_fv() -> Iterator[Tuple[FeatureStore, FeatureView]]:
+    with tempfile.NamedTemporaryFile(suffix=".parquet") as f:
+        df = create_dataset()
+        f.close()
+        df.to_parquet(f.name)
+        file_source = FileSource(
+            file_format=ParquetFormat(),
+            file_url=f"file://{f.name}",
+            event_timestamp_column="ts",
+            created_timestamp_column="created_ts",
+            date_partition_column="",
+            field_mapping={"ts_1": "ts", "id": "driver_id"},
+        )
+        fv = get_feature_view(file_source)
+        e = Entity(
+            name="driver",
+            description="id for driver",
+            join_key="driver_id",
+            value_type=ValueType.INT32,
+        )
+        project = f"test_dynamo_correctness_{str(uuid.uuid4()).replace('-', '')}"
+        print(f"Using project {project}")
+        with tempfile.TemporaryDirectory() as repo_dir_name:
+            config = RepoConfig(
+                registry=str(Path(repo_dir_name) / "registry.db"),
+                project=project,
+                provider="aws",
+                online_store=DynamoDBOnlineStoreConfig(region="us-west-2"),
+                offline_store=FileOfflineStoreConfig(),
+            )
+            fs = FeatureStore(config=config)
+            fs.apply([fv, e])
+
+            yield fs, fv
+
+            fs.teardown()
+
 
 # Checks that both offline & online store values are as expected
 def check_offline_and_online_features(
@@ -147,13 +242,26 @@ def check_offline_and_online_features(
     fv: FeatureView,
     driver_id: int,
     event_timestamp: datetime,
-    expected_value: float,
+    expected_value: Optional[float],
+    full_feature_names: bool,
 ) -> None:
     # Check online store
     response_dict = fs.get_online_features(
-        [f"{fv.name}:value"], [{"driver": driver_id}]
+        [f"{fv.name}:value"],
+        [{"driver": driver_id}],
+        full_feature_names=full_feature_names,
     ).to_dict()
-    assert abs(response_dict[f"{fv.name}__value"][0] - expected_value) < 1e-6
+
+    if full_feature_names:
+        if expected_value:
+            assert abs(response_dict[f"{fv.name}__value"][0] - expected_value) < 1e-6
+        else:
+            assert response_dict[f"{fv.name}__value"][0] is None
+    else:
+        if expected_value:
+            assert abs(response_dict["value"][0] - expected_value) < 1e-6
+        else:
+            assert response_dict["value"][0] is None
 
     # Check offline store
     df = fs.get_historical_features(
@@ -161,13 +269,23 @@ def check_offline_and_online_features(
             {"driver_id": [driver_id], "event_timestamp": [event_timestamp]}
         ),
         feature_refs=[f"{fv.name}:value"],
+        full_feature_names=full_feature_names,
     ).to_df()
 
-    assert abs(df.to_dict()[f"{fv.name}__value"][0] - expected_value) < 1e-6
+    if full_feature_names:
+        if expected_value:
+            assert abs(df.to_dict()[f"{fv.name}__value"][0] - expected_value) < 1e-6
+        else:
+            assert math.isnan(df.to_dict()[f"{fv.name}__value"][0])
+    else:
+        if expected_value:
+            assert abs(df.to_dict()["value"][0] - expected_value) < 1e-6
+        else:
+            assert math.isnan(df.to_dict()["value"][0])
 
 
 def run_offline_online_store_consistency_test(
-    fs: FeatureStore, fv: FeatureView
+    fs: FeatureStore, fv: FeatureView, full_feature_names: bool
 ) -> None:
     now = datetime.utcnow()
     # Run materialize()
@@ -178,12 +296,31 @@ def run_offline_online_store_consistency_test(
 
     # check result of materialize()
     check_offline_and_online_features(
-        fs=fs, fv=fv, driver_id=1, event_timestamp=end_date, expected_value=0.3
+        fs=fs,
+        fv=fv,
+        driver_id=1,
+        event_timestamp=end_date,
+        expected_value=0.3,
+        full_feature_names=full_feature_names,
+    )
+
+    check_offline_and_online_features(
+        fs=fs,
+        fv=fv,
+        driver_id=2,
+        event_timestamp=end_date,
+        expected_value=None,
+        full_feature_names=full_feature_names,
     )
 
     # check prior value for materialize_incremental()
     check_offline_and_online_features(
-        fs=fs, fv=fv, driver_id=3, event_timestamp=end_date, expected_value=4
+        fs=fs,
+        fv=fv,
+        driver_id=3,
+        event_timestamp=end_date,
+        expected_value=4,
+        full_feature_names=full_feature_names,
     )
 
     # run materialize_incremental()
@@ -191,7 +328,12 @@ def run_offline_online_store_consistency_test(
 
     # check result of materialize_incremental()
     check_offline_and_online_features(
-        fs=fs, fv=fv, driver_id=3, event_timestamp=now, expected_value=5
+        fs=fs,
+        fv=fv,
+        driver_id=3,
+        event_timestamp=now,
+        expected_value=5,
+        full_feature_names=full_feature_names,
     )
 
 
@@ -199,11 +341,29 @@ def run_offline_online_store_consistency_test(
 @pytest.mark.parametrize(
     "bq_source_type", ["query", "table"],
 )
-def test_bq_offline_online_store_consistency(bq_source_type: str):
+@pytest.mark.parametrize("full_feature_names", [True, False])
+def test_bq_offline_online_store_consistency(
+    bq_source_type: str, full_feature_names: bool
+):
     with prep_bq_fs_and_fv(bq_source_type) as (fs, fv):
-        run_offline_online_store_consistency_test(fs, fv)
+        run_offline_online_store_consistency_test(fs, fv, full_feature_names)
 
 
-def test_local_offline_online_store_consistency():
+@pytest.mark.parametrize("full_feature_names", [True, False])
+@pytest.mark.integration
+def test_redis_offline_online_store_consistency(full_feature_names: bool):
+    with prep_redis_fs_and_fv() as (fs, fv):
+        run_offline_online_store_consistency_test(fs, fv, full_feature_names)
+
+
+@pytest.mark.parametrize("full_feature_names", [True, False])
+@pytest.mark.integration
+def test_dynamodb_offline_online_store_consistency(full_feature_names: bool):
+    with prep_dynamodb_fs_and_fv() as (fs, fv):
+        run_offline_online_store_consistency_test(fs, fv, full_feature_names)
+
+
+@pytest.mark.parametrize("full_feature_names", [True, False])
+def test_local_offline_online_store_consistency(full_feature_names: bool):
     with prep_local_fs_and_fv() as (fs, fv):
-        run_offline_online_store_consistency_test(fs, fv)
+        run_offline_online_store_consistency_test(fs, fv, full_feature_names)

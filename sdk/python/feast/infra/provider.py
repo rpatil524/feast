@@ -5,7 +5,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas
 import pyarrow
+from tqdm import tqdm
 
+from feast import errors, importer
 from feast.entity import Entity
 from feast.feature_table import FeatureTable
 from feast.feature_view import FeatureView
@@ -16,7 +18,7 @@ from feast.registry import Registry
 from feast.repo_config import RepoConfig
 from feast.type_map import python_value_to_proto_value
 
-ENTITY_DF_EVENT_TIMESTAMP_COL = "event_timestamp"
+DEFAULT_ENTITY_DF_EVENT_TIMESTAMP_COL = "event_timestamp"
 
 
 class Provider(abc.ABC):
@@ -26,6 +28,8 @@ class Provider(abc.ABC):
         project: str,
         tables_to_delete: Sequence[Union[FeatureTable, FeatureView]],
         tables_to_keep: Sequence[Union[FeatureTable, FeatureView]],
+        entities_to_delete: Sequence[Entity],
+        entities_to_keep: Sequence[Entity],
         partial: bool,
     ):
         """
@@ -37,6 +41,10 @@ class Provider(abc.ABC):
                 clean up the corresponding cloud resources.
             tables_to_keep: Tables that are still in the feature repo. Depending on implementation,
                 provider may or may not need to update the corresponding resources.
+            entities_to_delete: Entities that were deleted from the feature repo, so provider needs to
+                clean up the corresponding cloud resources.
+            entities_to_keep: Entities that are still in the feature repo. Depending on implementation,
+                provider may or may not need to update the corresponding resources.
             partial: if true, then tables_to_delete and tables_to_keep are *not* exhaustive lists.
                 There may be other tables that are not touched by this update.
         """
@@ -44,7 +52,10 @@ class Provider(abc.ABC):
 
     @abc.abstractmethod
     def teardown_infra(
-        self, project: str, tables: Sequence[Union[FeatureTable, FeatureView]]
+        self,
+        project: str,
+        tables: Sequence[Union[FeatureTable, FeatureView]],
+        entities: Sequence[Entity],
     ):
         """
         Tear down all cloud resources for a repo.
@@ -52,13 +63,14 @@ class Provider(abc.ABC):
         Args:
             project: Feast project to which tables belong
             tables: Tables that are declared in the feature repo.
+            entities: Entities that are declared in the feature repo.
         """
         ...
 
     @abc.abstractmethod
     def online_write_batch(
         self,
-        project: str,
+        config: RepoConfig,
         table: Union[FeatureTable, FeatureView],
         data: List[
             Tuple[EntityKeyProto, Dict[str, ValueProto], datetime, Optional[datetime]]
@@ -72,7 +84,7 @@ class Provider(abc.ABC):
         If a tz-naive timestamp is passed to this method, it is assumed to be UTC.
 
         Args:
-            project: Feast project name
+            config: The RepoConfig for the current FeatureStore.
             table: Feast FeatureTable
             data: a list of quadruplets containing Feature data. Each quadruplet contains an Entity Key,
                 a dict containing feature values, an event timestamp for the row, and
@@ -85,32 +97,36 @@ class Provider(abc.ABC):
     @abc.abstractmethod
     def materialize_single_feature_view(
         self,
+        config: RepoConfig,
         feature_view: FeatureView,
         start_date: datetime,
         end_date: datetime,
         registry: Registry,
         project: str,
+        tqdm_builder: Callable[[int], tqdm],
     ) -> None:
         pass
 
-    @staticmethod
     @abc.abstractmethod
     def get_historical_features(
+        self,
         config: RepoConfig,
         feature_views: List[FeatureView],
         feature_refs: List[str],
         entity_df: Union[pandas.DataFrame, str],
         registry: Registry,
         project: str,
+        full_feature_names: bool,
     ) -> RetrievalJob:
         pass
 
     @abc.abstractmethod
     def online_read(
         self,
-        project: str,
+        config: RepoConfig,
         table: Union[FeatureTable, FeatureView],
         entity_keys: List[EntityKeyProto],
+        requested_features: List[str] = None,
     ) -> List[Tuple[Optional[datetime], Optional[Dict[str, ValueProto]]]]:
         """
         Read feature values given an Entity Key. This is a low level interface, not
@@ -125,28 +141,44 @@ class Provider(abc.ABC):
 
 
 def get_provider(config: RepoConfig, repo_path: Path) -> Provider:
-    if config.provider == "gcp":
-        from feast.infra.gcp import GcpProvider
+    if "." not in config.provider:
+        if config.provider == "gcp":
+            from feast.infra.gcp import GcpProvider
 
-        return GcpProvider(config)
-    elif config.provider == "local":
-        from feast.infra.local import LocalProvider
+            return GcpProvider(config)
+        elif config.provider == "aws":
+            from feast.infra.aws import AwsProvider
 
-        return LocalProvider(config, repo_path)
+            return AwsProvider(config)
+        elif config.provider == "local":
+            from feast.infra.local import LocalProvider
+
+            return LocalProvider(config)
+        else:
+            raise errors.FeastProviderNotImplementedError(config.provider)
     else:
-        raise ValueError(config)
+        # Split provider into module and class names by finding the right-most dot.
+        # For example, provider 'foo.bar.MyProvider' will be parsed into 'foo.bar' and 'MyProvider'
+        module_name, class_name = config.provider.rsplit(".", 1)
+
+        cls = importer.get_class_from_type(module_name, class_name, "Provider")
+
+        return cls(config, repo_path)
 
 
 def _get_requested_feature_views_to_features_dict(
     feature_refs: List[str], feature_views: List[FeatureView]
 ) -> Dict[FeatureView, List[str]]:
-    """Create a dict of FeatureView -> List[Feature] for all requested features"""
+    """Create a dict of FeatureView -> List[Feature] for all requested features.
+    Set full_feature_names to True to have feature names prefixed by their feature view name."""
 
-    feature_views_to_feature_map = {}  # type: Dict[FeatureView, List[str]]
+    feature_views_to_feature_map: Dict[FeatureView, List[str]] = {}
+
     for ref in feature_refs:
         ref_parts = ref.split(":")
         feature_view_from_ref = ref_parts[0]
         feature_from_ref = ref_parts[1]
+
         found = False
         for feature_view_from_registry in feature_views:
             if feature_view_from_registry.name == feature_view_from_ref:
@@ -162,6 +194,7 @@ def _get_requested_feature_views_to_features_dict(
 
         if not found:
             raise ValueError(f"Could not find feature view from reference {ref}")
+
     return feature_views_to_feature_map
 
 
@@ -258,7 +291,7 @@ def _convert_arrow_to_proto(
         feature_dict = {}
         for feature in feature_view.features:
             idx = table.column_names.index(feature.name)
-            value = python_value_to_proto_value(row[idx])
+            value = python_value_to_proto_value(row[idx], feature.dtype)
             feature_dict[feature.name] = value
         event_timestamp_idx = table.column_names.index(
             feature_view.input.event_timestamp_column
